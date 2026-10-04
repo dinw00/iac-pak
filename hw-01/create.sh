@@ -1,255 +1,236 @@
 #!/usr/bin/env bash
-# create.sh — поднимает стенд ДЗ 1 целиком с нуля.
-# Повторный запуск на поднятом стенде не падает и не создаёт дубликатов:
-# перед каждым созданием проверяется, что ресурса ещё нет.
+# ДЗ 1. Поднимает стенд для показа продукта целиком с нуля.
+# Повторный запуск не падает и не создаёт дубликатов: перед каждым созданием
+# проверяется, что ресурса ещё нет. В конце скрипт ждёт, пока check.sh вернёт 0.
 #
-#   ./create.sh                  # параметры варианта 05
-#   ./create.sh --web-count 3    # аргумент важнее переменной окружения и умолчания
+#   bash create.sh                  # значения варианта 05
+#   bash create.sh --web-count 3    # аргумент важнее переменной окружения и умолчания
+#   bash create.sh --help           # все параметры
+set -euo pipefail # стоп на первой ошибке и на пустой переменной
 
-set -euo pipefail
+# ---- параметры варианта ----
+# приоритет: аргумент командной строки > переменная окружения > умолчание из варианта
+PREFIX="${PREFIX:-pak-05}"                      # префикс имён ресурсов
+ZONE_A="${ZONE_A:-ru-central1-b}"               # зона A
+ZONE_B="${ZONE_B:-ru-central1-d}"               # зона B
+CIDR_A="${CIDR_A:-10.15.1.0/24}"                # подсеть в зоне A
+CIDR_B="${CIDR_B:-10.15.2.0/24}"                # подсеть в зоне B
+APP_PORT="${APP_PORT:-8015}"                    # порт, на котором отвечает nginx
+GREETING="${GREETING:-vmlab}"                   # слово из варианта, оно же на странице
+WEB_COUNT="${WEB_COUNT:-2}"                     # число веб-серверов
+ENV_NAME="${ENV_NAME:-lab}"                     # имя окружения — для меток
+BOOT_SIZE="${BOOT_SIZE:-20}"                    # загрузочный диск, ГБ — как в практике 2
+IMAGE_FAMILY="${IMAGE_FAMILY:-ubuntu-2404-lts}" # образ машин, как в практиках
+WAIT_LIMIT="${WAIT_LIMIT:-900}"                 # сколько секунд ждать готовности стенда
+NO_WAIT=0                                       # 1 — не ждать готовности
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=params.sh
-source "$HERE/params.sh"
-parse_args "$@"
-
-require_tools yc jq curl ssh sed
-require_cloud
-[[ -f "$SSH_KEY" ]] || die "нет публичного ключа $SSH_KEY (создайте: ssh-keygen -t ed25519) или укажите --ssh-key"
-TEMPLATE="$HERE/cloud-init.yaml.tpl"
-[[ -f "$TEMPLATE" ]] || die "нет шаблона $TEMPLATE"
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-START_TS=$(date +%s)
-
-skip()    { log "  = $* уже есть, пропускаю"; }
-created() { log "  + создан(а) $*"; }
-
-# ---------------------------------------------------------------------------
-# Проверка существования: смотрим КОД ВОЗВРАТА yc ... get, а не вывод.
-# Ошибки не глотаются через `|| true`: если создание упадёт, скрипт остановится.
-# ---------------------------------------------------------------------------
-exists() {
-  local kind="$1" name="$2"
-  case "$kind" in
-    network)  yc vpc network get "$name" ;;
-    subnet)   yc vpc subnet get "$name" ;;
-    gateway)  yc vpc gateway get "$name" ;;
-    rt)       yc vpc route-table get "$name" ;;
-    instance) yc compute instance get "$name" ;;
-    tg)       yc load-balancer target-group get "$name" ;;
-    nlb)      yc load-balancer network-load-balancer get "$name" ;;
-    *)        die "exists: неизвестный тип $kind" ;;
-  esac >/dev/null 2>&1
+usage() {
+  cat <<EOF
+Параметры (в скобках — текущее значение):
+  --prefix NAME     префикс имён ресурсов      ($PREFIX)       env: PREFIX
+  --zone-a ZONE     зона A                     ($ZONE_A)       env: ZONE_A
+  --zone-b ZONE     зона B                     ($ZONE_B)       env: ZONE_B
+  --cidr-a CIDR     подсеть в зоне A           ($CIDR_A)       env: CIDR_A
+  --cidr-b CIDR     подсеть в зоне B           ($CIDR_B)       env: CIDR_B
+  --port N          порт сервиса               ($APP_PORT)     env: APP_PORT
+  --greeting WORD   слово на странице          ($GREETING)     env: GREETING
+  --web-count N     веб-серверов, не меньше 2  ($WEB_COUNT)    env: WEB_COUNT
+  --env NAME        имя окружения для меток    ($ENV_NAME)     env: ENV_NAME
+  --boot-size N     загрузочный диск, ГБ       ($BOOT_SIZE)    env: BOOT_SIZE
+  --no-wait         не ждать, пока check.sh вернёт 0
+Приоритет: аргумент > переменная окружения > умолчание варианта 05.
+EOF
 }
 
-get_id()      { yc "$@" --format json | jq -r '.id'; }
-internal_ip() { yc compute instance get "$1" --format json | jq -r '.network_interfaces[0].primary_v4_address.address'; }
+# ---- аргументы командной строки ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix)    PREFIX="${2:?у $1 нет значения}";    shift 2 ;;
+    --zone-a)    ZONE_A="${2:?у $1 нет значения}";    shift 2 ;;
+    --zone-b)    ZONE_B="${2:?у $1 нет значения}";    shift 2 ;;
+    --cidr-a)    CIDR_A="${2:?у $1 нет значения}";    shift 2 ;;
+    --cidr-b)    CIDR_B="${2:?у $1 нет значения}";    shift 2 ;;
+    --port)      APP_PORT="${2:?у $1 нет значения}";  shift 2 ;;
+    --greeting)  GREETING="${2:?у $1 нет значения}";  shift 2 ;;
+    --web-count) WEB_COUNT="${2:?у $1 нет значения}"; shift 2 ;;
+    --env)       ENV_NAME="${2:?у $1 нет значения}";  shift 2 ;;
+    --boot-size) BOOT_SIZE="${2:?у $1 нет значения}"; shift 2 ;;
+    --no-wait)   NO_WAIT=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           echo "неизвестный аргумент: $1 (список: --help)" >&2; exit 1 ;;
+  esac
+done
 
-log "Стенд: префикс $PREFIX, зоны $ZONE_A / $ZONE_B, подсети $SUBNET_A_CIDR / $SUBNET_B_CIDR,"
-log "       порт $PORT, слово $WORD, веб-серверов $WEB_COUNT, окружение $ENV_NAME"
-
-# ---------------------------------------------------------------------------
-step "1/7 Сеть"
-# ---------------------------------------------------------------------------
-if exists network "$NET"; then
-  skip "сеть $NET"
-else
-  yc vpc network create --name "$NET" --labels "$LABELS" >/dev/null
-  created "сеть $NET"
+if ! [ "$WEB_COUNT" -ge 2 ] 2>/dev/null; then
+  echo "веб-серверов должно быть не меньше двух, иначе стенд не переживёт отказ машины" >&2
+  exit 1
 fi
 
-# ---------------------------------------------------------------------------
-step "2/7 NAT-шлюз и таблица маршрутизации"
-# ---------------------------------------------------------------------------
-if exists gateway "$NAT_GW"; then
-  skip "NAT-шлюз $NAT_GW"
-else
-  yc vpc gateway create --name "$NAT_GW" --labels "$LABELS" >/dev/null
-  created "NAT-шлюз $NAT_GW"
-fi
-GW_ID=$(get_id vpc gateway get "$NAT_GW")
+DIR="$(cd "$(dirname "$0")" && pwd)"   # каталог hw-01: запускать можно откуда угодно
+LABELS="env=$ENV_NAME,owner=$PREFIX"    # метки на всё, что создаём (задача со звёздочкой 1)
+ZONES=("$ZONE_A" "$ZONE_B")
+SUBNETS=("$PREFIX-subnet-a" "$PREFIX-subnet-b")
+CIDRS=("$CIDR_A" "$CIDR_B")
 
-if exists rt "$RT"; then
-  skip "таблица маршрутизации $RT"
+# Вывод команд create убираем в /dev/null, чтобы лог читался; ошибки идут в stderr и видны.
+# Проверка существования — по КОДУ ВОЗВРАТА yc ... get, а не по выводу и не через || true.
+
+echo "==> сеть"
+if yc vpc network get --name "$PREFIX-net" >/dev/null 2>&1; then
+  echo "сеть $PREFIX-net уже есть, пропускаю"
 else
-  yc vpc route-table create --name "$RT" --network-name "$NET" \
+  yc vpc network create --name "$PREFIX-net" --labels "$LABELS" >/dev/null
+  echo "сеть $PREFIX-net создана"
+fi
+
+echo "==> NAT-шлюз и таблица маршрутизации"
+if yc vpc gateway get --name "$PREFIX-nat" >/dev/null 2>&1; then
+  echo "NAT-шлюз $PREFIX-nat уже есть, пропускаю"
+else
+  yc vpc gateway create --name "$PREFIX-nat" --labels "$LABELS" >/dev/null
+  echo "NAT-шлюз $PREFIX-nat создан"
+fi
+GW_ID=$(yc vpc gateway get --name "$PREFIX-nat" --format json | jq -r .id)
+
+if yc vpc route-table get --name "$PREFIX-rt" >/dev/null 2>&1; then
+  echo "таблица маршрутизации $PREFIX-rt уже есть, пропускаю"
+else
+  yc vpc route-table create --name "$PREFIX-rt" --network-name "$PREFIX-net" \
     --route "destination=0.0.0.0/0,gateway-id=$GW_ID" \
     --labels "$LABELS" >/dev/null
-  created "таблица маршрутизации $RT (0.0.0.0/0 -> $NAT_GW)"
+  echo "таблица маршрутизации $PREFIX-rt создана: 0.0.0.0/0 -> $PREFIX-nat"
 fi
-RT_ID=$(get_id vpc route-table get "$RT")
 
-# ---------------------------------------------------------------------------
-step "3/7 Подсети"
-# ---------------------------------------------------------------------------
-ensure_subnet() {
-  local name="$1" zone="$2" cidr="$3"
-  if exists subnet "$name"; then
-    skip "подсеть $name"
-    # скрипт не умеет менять существующее — только предупреждает о расхождении
-    local cur
-    cur=$(yc vpc subnet get "$name" --format json | jq -r '.v4_cidr_blocks[0]')
-    [[ "$cur" == "$cidr" ]] || log "  ! у $name диапазон $cur, а запрошен $cidr — скрипт это не исправит"
+echo "==> подсети"
+for idx in 0 1; do
+  if yc vpc subnet get --name "${SUBNETS[$idx]}" >/dev/null 2>&1; then
+    echo "подсеть ${SUBNETS[$idx]} уже есть, пропускаю"
   else
-    yc vpc subnet create --name "$name" --network-name "$NET" --zone "$zone" \
-      --range "$cidr" --labels "$LABELS" >/dev/null
-    created "подсеть $name ($zone, $cidr)"
+    yc vpc subnet create --name "${SUBNETS[$idx]}" --network-name "$PREFIX-net" \
+      --zone "${ZONES[$idx]}" --range "${CIDRS[$idx]}" \
+      --labels "$LABELS" >/dev/null
+    echo "подсеть ${SUBNETS[$idx]} создана: ${ZONES[$idx]}, ${CIDRS[$idx]}"
   fi
-}
-ensure_subnet "$SUBNET_A" "$ZONE_A" "$SUBNET_A_CIDR"
-ensure_subnet "$SUBNET_B" "$ZONE_B" "$SUBNET_B_CIDR"
+done
 
-# Закрытый сервер приложения живёт в подсети A, ей нужен выход через NAT-шлюз.
-# Привязку тоже проверяем: подсеть могла остаться от прерванного запуска без таблицы.
-CUR_RT=$(yc vpc subnet get "$SUBNET_A" --format json | jq -r '.route_table_id // ""')
-if [[ "$CUR_RT" == "$RT_ID" ]]; then
-  skip "привязка $RT к $SUBNET_A"
+# Закрытому серверу приложения нужен выход в интернет, иначе cloud-init не скачает nginx.
+# Подсеть ссылается на таблицу, таблица — на шлюз. Привязку тоже проверяем:
+# подсеть могла остаться от прерванного запуска без таблицы.
+RT_ID=$(yc vpc route-table get --name "$PREFIX-rt" --format json | jq -r .id)
+CUR_RT=$(yc vpc subnet get --name "$PREFIX-subnet-a" --format json | jq -r '.route_table_id // ""')
+if [ "$CUR_RT" = "$RT_ID" ]; then
+  echo "таблица $PREFIX-rt уже привязана к $PREFIX-subnet-a, пропускаю"
 else
-  yc vpc subnet update "$SUBNET_A" --route-table-id "$RT_ID" >/dev/null
-  created "привязка $RT к $SUBNET_A"
+  yc vpc subnet update --name "$PREFIX-subnet-a" --route-table-name "$PREFIX-rt" >/dev/null
+  echo "таблица $PREFIX-rt привязана к $PREFIX-subnet-a"
 fi
 
-# ---------------------------------------------------------------------------
-step "4/7 Виртуальные машины"
-# ---------------------------------------------------------------------------
-# Экранирование значения для правой части sed s|...|...|
-sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
-SSH_KEY_TEXT=$(<"$SSH_KEY")
+echo "==> файл настройки из шаблона"
+SSH_KEY=$(cat ~/.ssh/id_ed25519.pub)
+export APP_PORT GREETING SSH_KEY
+# shellcheck disable=SC2016  # список переменных для envsubst — именно текст, без подстановки
+envsubst '${APP_PORT} ${GREETING} ${SSH_KEY}' \
+  < "$DIR/cloud-init.tpl.yaml" > "$DIR/cloud-init.yaml"
+# yc при --metadata-from-file сам подставляет переменные окружения на место $ИМЯ.
+# Так у нас nginx-овский $uri однажды превратился в пустую строку. $(hostname) он не трогает.
+if grep -nE '\$[A-Za-z0-9_{*#$@!?-]' "$DIR/cloud-init.yaml"; then
+  echo "в cloud-init.yaml остался знак доллара перед именем — yc заменит его пустой строкой" >&2
+  exit 1
+fi
 
-render_cloud_init() {
-  local host="$1" role="$2" out="$3"
-  sed -e "s|{{SSH_USER}}|$(sed_escape "$SSH_USER")|g" \
-      -e "s|{{SSH_KEY}}|$(sed_escape "$SSH_KEY_TEXT")|g" \
-      -e "s|{{PORT}}|$PORT|g" \
-      -e "s|{{WORD}}|$WORD|g" \
-      -e "s|{{HOST}}|$host|g" \
-      -e "s|{{ROLE}}|$role|g" \
-      "$TEMPLATE" > "$out"
-}
+echo "==> веб-серверы"
+for i in $(seq 1 "$WEB_COUNT"); do
+  idx=$(( (i - 1) % 2 ))   # 0, 1, 0, 1… — переключатель между зонами
+  if yc compute instance get --name "$PREFIX-web-$i" >/dev/null 2>&1; then
+    echo "машина $PREFIX-web-$i уже есть, пропускаю"
+  else
+    yc compute instance create \
+      --name "$PREFIX-web-$i" \
+      --zone "${ZONES[$idx]}" \
+      --platform standard-v3 \
+      --cores=2 --core-fraction=20 --memory=2 \
+      --preemptible \
+      --create-boot-disk image-folder-id=standard-images,image-family="$IMAGE_FAMILY",type=network-hdd,size="$BOOT_SIZE" \
+      --network-interface subnet-name="${SUBNETS[$idx]}",nat-ip-version=ipv4 \
+      --hostname "$PREFIX-web-$i" \
+      --metadata-from-file user-data="$DIR/cloud-init.yaml" \
+      --labels "$LABELS,role=web" >/dev/null
+    echo "машина $PREFIX-web-$i создана: ${ZONES[$idx]}, публичный адрес"
+  fi
+done
 
-# create_vm <имя> <зона> <подсеть> <роль> <public|private>
-create_vm() {
-  local name="$1" zone="$2" subnet="$3" role="$4" access="$5"
-  local user_data="$TMP_DIR/$name.yaml"
-  render_cloud_init "$name" "$role" "$user_data"
-
-  local extra=()
-  [[ "$VM_PREEMPTIBLE" == 1 ]] && extra+=(--preemptible)
-
-  local nic="subnet-name=$subnet"
-  # публичный адрес только у веб-серверов; сервер приложения — без nat-ip-version
-  [[ "$access" == public ]] && nic="$nic,nat-ip-version=ipv4"
-
+echo "==> сервер приложения"
+# без nat-ip-version: публичного адреса нет, наружу машина не смотрит
+if yc compute instance get --name "$PREFIX-app-1" >/dev/null 2>&1; then
+  echo "машина $PREFIX-app-1 уже есть, пропускаю"
+else
   yc compute instance create \
-    --name "$name" --hostname "$name" --zone "$zone" \
-    --platform standard-v3 --cores "$VM_CORES" --memory "$VM_MEMORY" \
-    --core-fraction "$VM_CORE_FRACTION" \
-    --create-boot-disk "name=$name-disk,image-folder-id=standard-images,image-family=$IMAGE_FAMILY,size=$VM_DISK_SIZE,type=network-hdd,auto-delete=true" \
-    --network-interface "$nic" \
-    --metadata-from-file "user-data=$user_data" \
-    --labels "$LABELS,role=$role" "${extra[@]}" >/dev/null
-}
-
-# Машины создаются параллельно, но каждая — только если её ещё нет
-declare -A PIDS=()
-for i in $(seq 1 "$WEB_COUNT"); do
-  name=$(web_name "$i")
-  if exists instance "$name"; then
-    skip "машина $name"
-  else
-    log "  … создаю $name ($(web_zone "$i"), публичный адрес)"
-    create_vm "$name" "$(web_zone "$i")" "$(web_subnet "$i")" web public &
-    PIDS[$name]=$!
-  fi
-done
-if exists instance "$APP_VM"; then
-  skip "машина $APP_VM"
-else
-  log "  … создаю $APP_VM ($ZONE_A, без публичного адреса)"
-  create_vm "$APP_VM" "$ZONE_A" "$SUBNET_A" app private &
-  PIDS[$APP_VM]=$!
+    --name "$PREFIX-app-1" \
+    --zone "$ZONE_A" \
+    --platform standard-v3 \
+    --cores=2 --core-fraction=20 --memory=2 \
+    --preemptible \
+    --create-boot-disk image-folder-id=standard-images,image-family="$IMAGE_FAMILY",type=network-hdd,size="$BOOT_SIZE" \
+    --network-interface subnet-name="$PREFIX-subnet-a" \
+    --hostname "$PREFIX-app-1" \
+    --metadata-from-file user-data="$DIR/cloud-init.yaml" \
+    --labels "$LABELS,role=app" >/dev/null
+  echo "машина $PREFIX-app-1 создана: $ZONE_A, без публичного адреса"
 fi
 
-FAILED_VMS=()
-for name in "${!PIDS[@]}"; do
-  if wait "${PIDS[$name]}"; then created "машина $name"; else FAILED_VMS+=("$name"); fi
-done
-(( ${#FAILED_VMS[@]} == 0 )) || die "не создались машины: ${FAILED_VMS[*]}"
-
-# ---------------------------------------------------------------------------
-step "5/7 Целевая группа"
-# ---------------------------------------------------------------------------
-TARGET_ARGS=()
-WEB_IPS=()
-for i in $(seq 1 "$WEB_COUNT"); do
-  ip=$(internal_ip "$(web_name "$i")")
-  WEB_IPS+=("$ip")
-  TARGET_ARGS+=(--target "subnet-name=$(web_subnet "$i"),address=$ip")
-done
-
-if exists tg "$TG"; then
-  skip "целевая группа $TG"
-  # недостающие цели добавляем, лишние скрипт не убирает
-  CUR_TARGETS=$(yc load-balancer target-group get "$TG" --format json | jq -r '.targets[]?.address')
+echo "==> целевая группа"
+if yc load-balancer target-group get --name "$PREFIX-tg" >/dev/null 2>&1; then
+  echo "целевая группа $PREFIX-tg уже есть, пропускаю"
+else
+  # собираем список веб-серверов: имя подсети и внутренний адрес каждого
+  TARGETS=""
+  IPS=""
   for i in $(seq 1 "$WEB_COUNT"); do
-    ip="${WEB_IPS[$((i-1))]}"
-    if ! grep -qxF "$ip" <<<"$CUR_TARGETS"; then
-      yc load-balancer target-group add-targets "$TG" \
-        --target "subnet-name=$(web_subnet "$i"),address=$ip" >/dev/null
-      created "цель $(web_name "$i") ($ip) в $TG"
-    fi
+    idx=$(( (i - 1) % 2 ))
+    IP=$(yc compute instance get --name "$PREFIX-web-$i" --format json \
+      | jq -r '.network_interfaces[0].primary_v4_address.address')
+    TARGETS="$TARGETS --target subnet-name=${SUBNETS[$idx]},address=$IP"
+    IPS="$IPS $IP"
   done
-else
-  yc load-balancer target-group create --name "$TG" --region-id ru-central1 \
-    "${TARGET_ARGS[@]}" --labels "$LABELS" >/dev/null
-  created "целевая группа $TG (${WEB_IPS[*]})"
+  # shellcheck disable=SC2086  # TARGETS должен разбиться на отдельные аргументы
+  yc load-balancer target-group create --name "$PREFIX-tg" --region-id ru-central1 \
+    $TARGETS --labels "$LABELS" >/dev/null
+  echo "целевая группа $PREFIX-tg создана:$IPS"
 fi
-TG_ID=$(get_id load-balancer target-group get "$TG")
 
-# ---------------------------------------------------------------------------
-step "6/7 Сетевой балансировщик"
-# ---------------------------------------------------------------------------
-HEALTHCHECK="target-group-id=$TG_ID,healthcheck-name=http,healthcheck-interval=2s,healthcheck-timeout=1s,healthcheck-unhealthythreshold=2,healthcheck-healthythreshold=2,healthcheck-http-port=$PORT,healthcheck-http-path=/"
-
-if exists nlb "$NLB"; then
-  skip "балансировщик $NLB"
-  if ! yc load-balancer network-load-balancer get "$NLB" --format json \
-       | jq -e --arg tg "$TG_ID" '[.attached_target_groups[]?.target_group_id] | index($tg)' >/dev/null; then
-    yc load-balancer network-load-balancer attach-target-group "$NLB" --target-group "$HEALTHCHECK" >/dev/null
-    created "подключение $TG к $NLB"
-  fi
+echo "==> балансировщик"
+TG_ID=$(yc load-balancer target-group get --name "$PREFIX-tg" --format json | jq -r .id)
+if yc load-balancer network-load-balancer get --name "$PREFIX-lb" >/dev/null 2>&1; then
+  echo "балансировщик $PREFIX-lb уже есть, пропускаю"
 else
-  yc load-balancer network-load-balancer create --name "$NLB" --region-id ru-central1 \
-    --listener "name=http,port=80,target-port=$PORT,protocol=tcp,external-ip-version=ipv4" \
-    --target-group "$HEALTHCHECK" \
+  yc load-balancer network-load-balancer create \
+    --name "$PREFIX-lb" \
+    --region-id ru-central1 \
+    --listener name=http,port=80,target-port="$APP_PORT",external-ip-version=ipv4 \
+    --target-group target-group-id="$TG_ID",healthcheck-name=http,healthcheck-interval=2s,healthcheck-timeout=1s,healthcheck-unhealthythreshold=2,healthcheck-healthythreshold=2,healthcheck-http-port="$APP_PORT",healthcheck-http-path=/ \
     --labels "$LABELS" >/dev/null
-  created "балансировщик $NLB (80 -> $PORT, проверка HTTP :$PORT/)"
+  echo "балансировщик $PREFIX-lb создан: 80 -> $APP_PORT, проверка HTTP :$APP_PORT/"
 fi
-LB_IP=$(yc load-balancer network-load-balancer get "$NLB" --format json | jq -r '.listeners[0].address')
+LB_IP=$(yc load-balancer network-load-balancer get --name "$PREFIX-lb" --format json \
+  | jq -r '.listeners[0].address')
 
-# ---------------------------------------------------------------------------
-step "7/7 Ожидание готовности"
-# ---------------------------------------------------------------------------
+echo "==> ожидание готовности"
 # Команды create возвращают управление раньше, чем cloud-init поставил nginx.
 # Готовым стенд считается, когда check.sh вернул 0.
-if [[ "$NO_WAIT" == 1 ]]; then
-  log "  пропущено (--no-wait). Проверка: bash $HERE/check.sh"
+if [ "$NO_WAIT" = 1 ]; then
+  echo "пропущено (--no-wait), проверка: bash $DIR/check.sh"
 else
-  export PREFIX ZONE_A ZONE_B SUBNET_A_CIDR SUBNET_B_CIDR PORT WORD WEB_COUNT ENV_NAME SSH_USER SSH_KEY
-  deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
-  until bash "$HERE/check.sh" >/dev/null 2>&1; do
-    if (( $(date +%s) >= deadline )); then
-      log "  стенд не пришёл в норму за ${WAIT_TIMEOUT} с. Последний вывод check.sh:"
-      bash "$HERE/check.sh" || true
+  export PREFIX   # APP_PORT и GREETING уже экспортированы для envsubst
+  until bash "$DIR/check.sh" >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$WAIT_LIMIT" ]; then
+      echo "стенд не пришёл в норму за $WAIT_LIMIT с, последний вывод check.sh:"
+      bash "$DIR/check.sh" || true
       exit 1
     fi
-    log "  ждём… $(( $(date +%s) - START_TS )) с от старта"
-    sleep 15
+    echo "ждём… $SECONDS с от старта"
+    sleep 10
   done
-  log "  check.sh вернул 0 — стенд готов"
+  echo "check.sh вернул 0 — стенд готов"
 fi
 
-log ""
-log "Готово за $(( $(date +%s) - START_TS )) с. Стенд: http://$LB_IP/"
+echo "==> готово за $SECONDS с: http://$LB_IP"

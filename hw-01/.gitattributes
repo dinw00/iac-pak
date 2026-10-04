@@ -1,4 +1,4 @@
-# скрипты должны иметь переводы строк LF, иначе bash в WSL падает на \r
-*.sh   text eol=lf
-*.tpl  text eol=lf
-*.md   text eol=lf
+# скрипты и шаблон — с переводами строк LF, иначе bash в WSL падает на \r
+*.sh    text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf

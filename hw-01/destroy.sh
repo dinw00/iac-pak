@@ -1,146 +1,121 @@
 #!/usr/bin/env bash
-# destroy.sh — удаляет всё, что создал create.sh.
-# Не полагается на то, что в облаке ровно созданные им ресурсы:
-# находит своё по префиксу имени (или по метке owner, ключ --by-label) и удаляет найденное.
+# ДЗ 1. Удаляет всё, что создал create.sh.
+# Не полагается на то, что в облаке ровно созданные им ресурсы: спрашивает облако,
+# что заведено с нашим префиксом (или с меткой owner, ключ --by-label), и удаляет найденное.
+# Отрабатывает на любом состоянии стенда: чего уже нет, того он просто не найдёт.
 #
-#   ./destroy.sh               # поиск по префиксу "pak-05-"
-#   ./destroy.sh --by-label    # поиск по метке owner=pak-05 (задача со звёздочкой 1)
+#   bash destroy.sh               # поиск по префиксу pak-05-
+#   bash destroy.sh --by-label    # поиск по метке owner=pak-05 (задача со звёздочкой 1)
+set -euo pipefail # стоп на первой ошибке и на пустой переменной
 
-set -euo pipefail
+# ---- параметры варианта ----
+PREFIX="${PREFIX:-pak-05}"   # префикс имён ресурсов
+BY_LABEL=0                   # 1 — искать по метке owner, а не по префиксу имени
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=params.sh
-source "$HERE/params.sh"
-parse_args "$@"
-require_tools yc jq
-require_cloud
+# ---- аргументы командной строки ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix)   PREFIX="${2:?у $1 нет значения}"; shift 2 ;;
+    --by-label) BY_LABEL=1; shift ;;
+    -h|--help)  echo "параметры: --prefix ($PREFIX), --by-label"; exit 0 ;;
+    *)          echo "неизвестный аргумент: $1" >&2; exit 1 ;;
+  esac
+done
 
-START_TS=$(date +%s)
-
-# mine: из JSON-списка yc ... list выбирает имена своих ресурсов.
-# По префиксу сравниваем с "pak-05-", а не с "pak-05": иначе зацепим чужой pak-050-net.
-mine() {
-  if [[ "$BY_LABEL" == 1 ]]; then
-    jq -r --arg owner "$PREFIX" '.[] | select((.labels.owner // "") == $owner) | .name'
-  else
-    jq -r --arg p "$PREFIX-" '.[] | select(.name | startswith($p)) | .name'
-  fi
-}
+# Какие ресурсы считаем своими. Префикс сравниваем вместе с дефисом:
+# "pak-05-" не зацепит чужой "pak-050-net".
+if [ "$BY_LABEL" = 1 ]; then
+  echo "ищу ресурсы с меткой owner=$PREFIX"
+  MINE="select(.labels.owner == \"$PREFIX\")"
+else
+  echo "ищу ресурсы с префиксом $PREFIX-"
+  MINE="select((.name // \"\") | startswith(\"$PREFIX-\"))"
+fi
 # Загрузочные диски создаются вместе с машиной и меток не получают,
-# поэтому диски ищутся только по префиксу имени (pak-05-web-1-disk и т. п.)
-mine_by_prefix() { jq -r --arg p "$PREFIX-" '.[] | select(.name // "" | startswith($p)) | .name'; }
+# поэтому диски ищем только по имени.
+BY_NAME="select((.name // \"\") | startswith(\"$PREFIX-\"))"
 
-if [[ "$BY_LABEL" == 1 ]]; then
-  log "Ищу ресурсы с меткой owner=$PREFIX"
-else
-  log "Ищу ресурсы с префиксом $PREFIX-"
-fi
+# Порядок обратный созданию: сначала то, что ссылается на другие ресурсы.
 
-# delete_all <что> <команда list...> -- <команда delete...>
-delete_all() {
-  local what="$1"; shift
-  local list_cmd=() del_cmd=()
-  while [[ "$1" != "--" ]]; do list_cmd+=("$1"); shift; done; shift
-  del_cmd=("$@")
-  local names
-  mapfile -t names < <("${list_cmd[@]}" --format json | mine)
-  if (( ${#names[@]} == 0 )); then
-    log "  = $what: нечего удалять"
-    return
-  fi
-  local n
-  for n in "${names[@]}"; do
-    "${del_cmd[@]}" "$n" >/dev/null
-    log "  - удалён(а) $what $n"
-  done
-}
+echo "==> балансировщики"
+yc load-balancer network-load-balancer list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      yc load-balancer network-load-balancer delete "$name" >/dev/null
+      echo "удалён балансировщик $name"
+    done
 
-# Порядок обратный созданию: сначала то, что ссылается, потом то, на что ссылаются
+echo "==> целевые группы"
+yc load-balancer target-group list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      yc load-balancer target-group delete "$name" >/dev/null
+      echo "удалена целевая группа $name"
+    done
 
-step "1/7 Балансировщики"
-delete_all "балансировщик" yc load-balancer network-load-balancer list -- yc load-balancer network-load-balancer delete
+echo "==> машины"
+yc compute instance list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      yc compute instance delete "$name" >/dev/null
+      echo "удалена машина $name"
+    done
 
-step "2/7 Целевые группы"
-delete_all "целевая группа" yc load-balancer target-group list -- yc load-balancer target-group delete
+echo "==> оставшиеся диски"
+# загрузочные удаляются вместе с машиной; здесь — всё, что почему-то осталось
+yc compute disk list --format json | jq -r ".[] | $BY_NAME | .name" \
+  | while read -r name; do
+      yc compute disk delete "$name" >/dev/null
+      echo "удалён диск $name"
+    done
 
-step "3/7 Виртуальные машины (параллельно)"
-mapfile -t VMS < <(yc compute instance list --format json | mine)
-if (( ${#VMS[@]} == 0 )); then
-  log "  = машины: нечего удалять"
-else
-  declare -A PIDS=()
-  for vm in "${VMS[@]}"; do
-    log "  … удаляю $vm"
-    yc compute instance delete "$vm" >/dev/null &
-    PIDS[$vm]=$!
-  done
-  for vm in "${!PIDS[@]}"; do
-    if wait "${PIDS[$vm]}"; then log "  - удалена машина $vm"; else die "не удалилась машина $vm"; fi
-  done
-fi
+echo "==> подсети: сначала отвязываем таблицу маршрутизации"
+yc vpc subnet list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      if [ -n "$(yc vpc subnet get --name "$name" --format json | jq -r '.route_table_id // empty')" ]; then
+        yc vpc subnet update --name "$name" --disassociate-route-table >/dev/null
+        echo "таблица маршрутизации отвязана от $name"
+      fi
+      yc vpc subnet delete "$name" >/dev/null
+      echo "удалена подсеть $name"
+    done
 
-step "4/7 Оставшиеся диски"
-mapfile -t DISKS < <(yc compute disk list --format json | mine_by_prefix)
-if (( ${#DISKS[@]} == 0 )); then
-  log "  = диски: нечего удалять (загрузочные удалились вместе с машинами)"
-else
-  for d in "${DISKS[@]}"; do yc compute disk delete "$d" >/dev/null; log "  - удалён диск $d"; done
-fi
+echo "==> таблицы маршрутизации"
+yc vpc route-table list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      yc vpc route-table delete "$name" >/dev/null
+      echo "удалена таблица маршрутизации $name"
+    done
 
-step "5/7 Подсети (сначала отвязываем таблицу маршрутизации)"
-mapfile -t SUBNETS < <(yc vpc subnet list --format json | mine)
-if (( ${#SUBNETS[@]} == 0 )); then
-  log "  = подсети: нечего удалять"
-else
-  for s in "${SUBNETS[@]}"; do
-    if [[ -n "$(yc vpc subnet get "$s" --format json | jq -r '.route_table_id // empty')" ]]; then
-      yc vpc subnet update "$s" --disassociate-route-table >/dev/null
-      log "  - таблица маршрутизации отвязана от $s"
-    fi
-    yc vpc subnet delete "$s" >/dev/null
-    log "  - удалена подсеть $s"
-  done
-fi
+echo "==> NAT-шлюзы"
+yc vpc gateway list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      yc vpc gateway delete "$name" >/dev/null
+      echo "удалён NAT-шлюз $name"
+    done
 
-step "6/7 Таблицы маршрутизации и NAT-шлюзы"
-delete_all "таблица маршрутизации" yc vpc route-table list -- yc vpc route-table delete
-delete_all "NAT-шлюз" yc vpc gateway list -- yc vpc gateway delete
+echo "==> сети"
+yc vpc network list --format json | jq -r ".[] | $MINE | .name" \
+  | while read -r name; do
+      yc vpc network delete "$name" >/dev/null
+      echo "удалена сеть $name"
+    done
 
-step "7/7 Сети"
-delete_all "сеть" yc vpc network list -- yc vpc network delete
-
-# ---------------------------------------------------------------------------
-step "Контроль: что осталось"
-# ---------------------------------------------------------------------------
+echo "==> что осталось с префиксом $PREFIX-"
 LEFT=0
-count_left() {
-  local what="$1"; shift
-  local names
-  mapfile -t names < <("$@" --format json | mine_by_prefix)
-  if (( ${#names[@]} > 0 )); then
-    log "  ✗ $what: ${names[*]}"
-    LEFT=$((LEFT + ${#names[@]}))
+for kind in "compute instance" "compute disk" "vpc subnet" "vpc route-table" "vpc gateway" \
+            "vpc network" "load-balancer network-load-balancer" "load-balancer target-group"; do
+  # shellcheck disable=SC2086  # kind — это две части команды yc, их нужно разбить
+  names=$(yc $kind list --format json | jq -r ".[] | $BY_NAME | .name" | paste -sd' ' -)
+  if [ -n "$names" ]; then
+    echo "✗ $kind: $names"
+    LEFT=1
   else
-    log "  ✓ $what: нет"
+    echo "✓ $kind: пусто"
   fi
-}
-count_left "балансировщики"   yc load-balancer network-load-balancer list
-count_left "целевые группы"   yc load-balancer target-group list
-count_left "машины"           yc compute instance list
-count_left "диски"            yc compute disk list
-count_left "подсети"          yc vpc subnet list
-count_left "таблицы маршрут." yc vpc route-table list
-count_left "NAT-шлюзы"        yc vpc gateway list
-count_left "сети"             yc vpc network list
+done
 
-UNUSED_ADDR=$(yc vpc address list --format json | jq '[.[] | select(.used != true)] | length')
-log "  i неиспользуемых публичных адресов в каталоге: $UNUSED_ADDR (динамические адреса освобождаются сами)"
-
-log ""
-if (( LEFT == 0 )); then
-  log "Убрано за $(( $(date +%s) - START_TS )) с. Ресурсов с префиксом $PREFIX- не осталось."
+if [ "$LEFT" = 0 ]; then
+  echo "==> убрано за $SECONDS с, ресурсов с префиксом $PREFIX- не осталось"
   exit 0
 else
-  log "Осталось ресурсов: $LEFT — запустите destroy.sh ещё раз или удалите вручную."
+  echo "==> остались ресурсы: запустите destroy.sh ещё раз или удалите вручную" >&2
   exit 1
 fi

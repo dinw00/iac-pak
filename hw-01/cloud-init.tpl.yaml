@@ -1,0 +1,23 @@
+#cloud-config
+# Шаблон настройки машин стенда ДЗ 1 — тот же, что в практике 2.
+# Ключ, порт и слово подставляет create.sh через envsubst, готовый файл —
+# hw-01/cloud-init.yaml (он в .gitignore). Веб-серверы и сервер приложения
+# настраиваются одинаково, различаются только именем хоста на странице.
+users:
+  - name: student                       # логин, под которым заходим по SSH
+    groups: sudo                        # членство в группе даёт право на sudo
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']    # без пароля: пароля у пользователя и нет
+    ssh_authorized_keys:
+      - ${SSH_KEY}
+package_update: true                    # обновить список пакетов перед установкой
+packages:
+  - nginx                               # ставится при первой загрузке машины
+runcmd:
+  # меняем порт в конфигурации nginx: сначала IPv4, потом IPv6
+  - sed -i 's/listen 80 default_server;/listen ${APP_PORT} default_server;/' /etc/nginx/sites-available/default
+  - sed -i 's/listen \[::\]:80 default_server;/listen [::]:${APP_PORT} default_server;/' /etc/nginx/sites-available/default
+  # страницу перезаписываем целиком: слово варианта и имя машины в одной строке
+  - bash -c 'echo "${GREETING} on $(hostname)" > /var/www/html/index.nginx-debian.html'
+  - nginx -t                            # проверка конфигурации: опечатка вылезет здесь
+  - systemctl restart nginx             # без перезапуска nginx остался бы на порту 80

@@ -1,103 +1,109 @@
 #!/usr/bin/env bash
-# check.sh — проверяет, что стенд ДЗ 1 работает.
-# По строке на проверку; код возврата 0 — все проверки прошли, 1 — хотя бы одна нет.
+# ДЗ 1. Проверяет, что стенд работает, и печатает по строке на каждую проверку.
+# Код возврата: 0 — прошли все проверки, 1 — не прошла хотя бы одна.
 # Пишется для раннера: смотреть нужно на код возврата, а не на текст.
 #
-#   ./check.sh; echo "код возврата: $?"
+#   bash check.sh; echo "код возврата: $?"
+set -uo pipefail # без -e: упавшая проверка не должна обрывать остальные
 
-set -uo pipefail   # без -e: упавшая проверка не должна обрывать остальные
+# ---- параметры варианта ----
+# приоритет: аргумент командной строки > переменная окружения > умолчание из варианта
+PREFIX="${PREFIX:-pak-05}"          # префикс имён ресурсов
+APP_PORT="${APP_PORT:-8015}"        # порт, на котором отвечает nginx
+GREETING="${GREETING:-vmlab}"       # слово из варианта, оно же на странице
+SSH_USER="${SSH_USER:-student}"     # пользователя заводит cloud-init
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=params.sh
-source "$HERE/params.sh"
-parse_args "$@"
-require_tools yc jq curl ssh
+# ---- аргументы командной строки ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix)   PREFIX="${2:?у $1 нет значения}";   shift 2 ;;
+    --port)     APP_PORT="${2:?у $1 нет значения}"; shift 2 ;;
+    --greeting) GREETING="${2:?у $1 нет значения}"; shift 2 ;;
+    -h|--help)  echo "параметры: --prefix ($PREFIX), --port ($APP_PORT), --greeting ($GREETING)"; exit 0 ;;
+    *)          echo "неизвестный аргумент: $1" >&2; exit 1 ;;
+  esac
+done
 
 FAILED=0
-pass() { printf '✓ %s\n' "$*"; }
-fail() { printf '✗ %s\n' "$*"; FAILED=$((FAILED + 1)); }
+ok()   { echo "✓ $*"; }
+fail() { echo "✗ $*"; FAILED=1; }
 
-SSH_OPTS=(-i "${SSH_KEY%.pub}" -o BatchMode=yes -o ConnectTimeout=5
-          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+# ssh для раннера: без вопроса про ключ хоста (адреса после пересоздания стенда
+# достаются другим машинам) и без зависаний, если машина не отвечает
+SSH=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+         -o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR)
 
-# --- Исходные данные: адрес балансировщика, адреса машин ---------------------
-LB_IP=""
-if LB_JSON=$(yc load-balancer network-load-balancer get "$NLB" --format json 2>/dev/null); then
-  LB_IP=$(jq -r '.listeners[0].address // empty' <<<"$LB_JSON")
-fi
+# ---- адреса: балансировщик, web-1 снаружи, app-1 внутри ----
+LB_IP=$(yc load-balancer network-load-balancer get --name "$PREFIX-lb" --format json 2>/dev/null \
+  | jq -r '.listeners[0].address // empty')
+WEB1_IP=$(yc compute instance get --name "$PREFIX-web-1" --format json 2>/dev/null \
+  | jq -r '.network_interfaces[0].primary_v4_address.one_to_one_nat.address // empty')
+APP_JSON=$(yc compute instance get --name "$PREFIX-app-1" --format json 2>/dev/null)
+APP_IP=$(echo "$APP_JSON" | jq -r '.network_interfaces[0].primary_v4_address.address // empty' 2>/dev/null)
+APP_PUBLIC=$(echo "$APP_JSON" | jq -r '.network_interfaces[0].primary_v4_address.one_to_one_nat.address // empty' 2>/dev/null)
 
-WEB1="$(web_name 1)"
-WEB1_IP=""
-if WEB1_JSON=$(yc compute instance get "$WEB1" --format json 2>/dev/null); then
-  WEB1_IP=$(jq -r '.network_interfaces[0].primary_v4_address.one_to_one_nat.address // empty' <<<"$WEB1_JSON")
-fi
-
-APP_IP=""
-APP_PUBLIC=""
-if APP_JSON=$(yc compute instance get "$APP_VM" --format json 2>/dev/null); then
-  APP_IP=$(jq -r '.network_interfaces[0].primary_v4_address.address // empty' <<<"$APP_JSON")
-  APP_PUBLIC=$(jq -r '.network_interfaces[0].primary_v4_address.one_to_one_nat.address // empty' <<<"$APP_JSON")
-fi
-
-# --- 1. Балансировщик отвечает кодом 200 -------------------------------------
-if [[ -z "$LB_IP" ]]; then
-  fail "балансировщик $NLB не найден"
+# ---- 1. балансировщик отвечает кодом 200 ----
+CODE=""
+if [ -z "$LB_IP" ]; then
+  fail "балансировщик $PREFIX-lb не найден"
 else
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$LB_IP/")
-  if [[ "$CODE" == 200 ]]; then
-    pass "балансировщик отвечает: 200 (http://$LB_IP/)"
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$LB_IP")
+  if [ "$CODE" = 200 ]; then
+    ok "балансировщик отвечает: 200 (http://$LB_IP)"
   else
-    fail "балансировщик http://$LB_IP/ отвечает кодом $CODE, ожидался 200"
+    fail "балансировщик http://$LB_IP отвечает: $CODE, ожидался 200"
   fi
 fi
 
-# --- 2. Ответы приходят больше чем с одной машины ----------------------------
-# Каждый запрос curl — новое соединение с новым портом источника,
-# балансировщик хеширует их по разным машинам.
-if [[ -z "$LB_IP" ]]; then
+# ---- 2. ответы приходят больше чем с одной машины ----
+# каждый curl — новое соединение с новым портом источника, балансировщик
+# раскладывает их по хешу на разные машины
+if [ -z "$LB_IP" ]; then
   fail "распределение не проверить: нет балансировщика"
+elif [ "$CODE" != 200 ]; then
+  # не тратим 20 запросов с таймаутами на балансировщик, который и так не отвечает
+  fail "распределение не проверить: балансировщик не отвечает 200"
 else
   HOSTS=$(for _ in $(seq 1 20); do
-            curl -s -m 3 "http://$LB_IP/" | sed -n 's/.*host: \([a-z0-9-]*\).*/\1/p'
-          done | sort -u)
-  N_HOSTS=$(grep -c . <<<"$HOSTS")
-  HOST_LIST=$(paste -sd, <<<"$HOSTS" | sed 's/,/, /g')
-  if (( N_HOSTS > 1 )); then
-    pass "ответили машины: $HOST_LIST"
-  elif (( N_HOSTS == 1 )); then
-    fail "отвечает только одна машина: $HOST_LIST"
+            curl -s -m 3 "http://$LB_IP" | grep -m1 -o "$GREETING on [a-z0-9-]*"
+          done | sed "s/^$GREETING on //" | sort -u)
+  N=$(echo "$HOSTS" | grep -c .)
+  LIST=$(echo "$HOSTS" | paste -sd, - | sed 's/,/, /g')
+  if [ "$N" -gt 1 ]; then
+    ok "ответили машины: $LIST"
+  elif [ "$N" -eq 1 ]; then
+    fail "отвечает только одна машина: $LIST"
   else
     fail "ни одна машина не ответила через балансировщик"
   fi
 fi
 
-# --- 3. Сервер приложения доступен с веб-сервера по внутреннему адресу -------
-if [[ -z "$APP_IP" ]]; then
-  fail "сервер приложения $APP_VM не найден"
-elif [[ -z "$WEB1_IP" ]]; then
-  fail "сервер приложения не проверить: нет $WEB1 с публичным адресом"
+# ---- 3. сервер приложения доступен с веб-сервера по внутреннему адресу ----
+if [ -z "$APP_IP" ]; then
+  fail "сервер приложения $PREFIX-app-1 не найден"
+elif [ -z "$WEB1_IP" ]; then
+  fail "сервер приложения не проверить: нет $PREFIX-web-1 с публичным адресом"
 else
-  # shellcheck disable=SC2029  # адрес и порт подставляются на нашей стороне — так и задумано
-  APP_CODE=$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$WEB1_IP" \
-               "curl -s -o /dev/null -w '%{http_code}' -m 5 http://$APP_IP:$PORT/" 2>/dev/null)
-  if [[ "$APP_CODE" == 200 ]]; then
-    pass "сервер приложения $APP_IP:$PORT отвечает с $WEB1: 200"
+  ANSWER=$("${SSH[@]}" "$SSH_USER@$WEB1_IP" "curl -s -m 5 http://$APP_IP:$APP_PORT" 2>/dev/null \
+    | grep -m1 -o "$GREETING on [a-z0-9-]*")
+  if [ "$ANSWER" = "$GREETING on $PREFIX-app-1" ]; then
+    ok "сервер приложения $APP_IP:$APP_PORT отвечает с $PREFIX-web-1: $ANSWER"
   else
-    fail "сервер приложения $APP_IP:$PORT недоступен с $WEB1 (код: ${APP_CODE:-нет ответа})"
+    fail "сервер приложения $APP_IP:$APP_PORT недоступен с $PREFIX-web-1"
   fi
 fi
 
-# --- 4. У сервера приложения нет публичного адреса ---------------------------
-if [[ -z "$APP_IP" ]]; then
-  fail "публичный адрес не проверить: нет $APP_VM"
-elif [[ -n "$APP_PUBLIC" ]]; then
-  fail "у $APP_VM есть публичный адрес $APP_PUBLIC — сервис смотрит наружу"
+# ---- 4. у сервера приложения нет публичного адреса ----
+if [ -z "$APP_IP" ]; then
+  fail "публичный адрес не проверить: нет $PREFIX-app-1"
+elif [ -n "$APP_PUBLIC" ]; then
+  fail "у $PREFIX-app-1 есть публичный адрес $APP_PUBLIC — сервис смотрит наружу"
 else
-  pass "у $APP_VM нет публичного адреса"
+  ok "у $PREFIX-app-1 нет публичного адреса"
 fi
 
-# Код возврата задаётся явно: иначе он был бы кодом последней команды
-if (( FAILED == 0 )); then
+# код возврата задаём явно: иначе он был бы кодом последней команды
+if [ "$FAILED" = 0 ]; then
   exit 0
 else
   exit 1
